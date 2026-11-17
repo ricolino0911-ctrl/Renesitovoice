@@ -1,0 +1,588 @@
+<<<FILE:settings.gradle>>>
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+rootProject.name = "RenesitoVoice"
+include ":app"
+<<<END>>>
+<<<FILE:build.gradle>>>
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+}
+<<<END>>>
+<<<FILE:gradle.properties>>>
+org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+<<<END>>>
+<<<FILE:app/build.gradle>>>
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.renesito.voice'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.renesito.voice'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+    buildTypes {
+        release { minifyEnabled false }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}
+<<<END>>>
+<<<FILE:app/src/main/AndroidManifest.xml>>>
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <application
+        android:label="Renesito Voice"
+        android:icon="@drawable/ic_launcher"
+        android:allowBackup="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".FloatingService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+    </application>
+</manifest>
+<<<END>>>
+<<<FILE:app/src/main/res/drawable/ic_launcher.xml>>>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#14161D" android:pathData="M0,0h108v108h-108z" />
+    <path android:fillColor="#2F6BFF"
+        android:pathData="M54,30m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M54,22a7,7 0,0 1,7 7v14a7,7 0,0 1,-14 0v-14a7,7 0,0 1,7 -7z" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M38,42h4v2a12,12 0,0 0,24 0v-2h4v2a16,16 0,0 1,-14 15.9v6.1h9v4h-22v-4h9v-6.1a16,16 0,0 1,-14 -15.9z" />
+</vector>
+<<<END>>>
+<<<FILE:app/src/main/java/com/renesito/voice/VoiceEngine.kt>>>
+package com.renesito.voice
+
+import android.annotation.SuppressLint
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+
+class VoiceEngine {
+
+    companion object {
+        const val SR = 48000
+        const val FRAME = 960
+        const val NBUF = 4096
+        const val GRAIN = 1024
+    }
+
+    @Volatile var pitchSemis = 0f
+    @Volatile var drive = 0f
+    @Volatile var ring = 0f
+    @Volatile var ringHz = 60f
+    @Volatile var running = false
+
+    var levelListener: ((Float) -> Unit)? = null
+
+    private var thread: Thread? = null
+    private val buf = FloatArray(NBUF)
+    private var w = 0
+    private var ph = 0f
+    private var ringPh = 0f
+
+    fun configure(p: Float, d: Float, r: Float, hz: Float) {
+        pitchSemis = p.coerceIn(-12f, 12f)
+        drive = d.coerceIn(0f, 1f)
+        ring = r.coerceIn(0f, 1f)
+        ringHz = hz.coerceIn(5f, 300f)
+    }
+
+    fun start() {
+        if (running) return
+        running = true
+        thread = Thread { loop() }.apply {
+            priority = Thread.MAX_PRIORITY
+            start()
+        }
+    }
+
+    fun stop() {
+        running = false
+        try { thread?.join(600) } catch (_: Exception) {}
+        thread = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun loop() {
+        val minRec = AudioRecord.getMinBufferSize(
+            SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val minTrk = AudioTrack.getMinBufferSize(
+            SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val rec = AudioRecord(
+            MediaRecorder.AudioSource.MIC, SR,
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minRec, FRAME * 6)
+        )
+        val trk = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SR)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minTrk, FRAME * 6))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        val inS = ShortArray(FRAME)
+        val outS = ShortArray(FRAME)
+
+        try {
+            rec.startRecording()
+            trk.play()
+            while (running) {
+                val n = rec.read(inS, 0, FRAME)
+                if (n <= 0) continue
+                process(inS, outS, n)
+                trk.write(outS, 0, n)
+                var acc = 0f
+                for (i in 0 until n) {
+                    val v = outS[i] / 32768f
+                    acc += v * v
+                }
+                levelListener?.invoke(Math.sqrt((acc / n).toDouble()).toFloat())
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            try { rec.stop() } catch (_: Exception) {}
+            rec.release()
+            try { trk.stop() } catch (_: Exception) {}
+            trk.release()
+        }
+    }
+
+    private fun process(inp: ShortArray, outp: ShortArray, n: Int) {
+        val ratio = Math.pow(2.0, (pitchSemis / 12f).toDouble()).toFloat()
+        val step = (1f - ratio) / GRAIN
+        var phase = ph
+        var rp = ringPh
+        val ringInc = (2.0 * Math.PI * ringHz / SR).toFloat()
+        val dr = drive
+        val rg = ring
+        val mask = NBUF - 1
+
+        for (i in 0 until n) {
+            val s = inp[i] / 32768f
+            buf[w] = s
+            w = (w + 1) and mask
+
+            phase += step
+            if (phase >= 1f) phase -= 1f else if (phase < 0f) phase += 1f
+
+            val dA = phase * GRAIN
+            val dB = dA + GRAIN
+            val gA = 0.5f - 0.5f * Math.cos((2.0 * Math.PI * phase).toDouble()).toFloat()
+            var p2 = phase + 0.5f
+            if (p2 >= 1f) p2 -= 1f
+            val gB = 0.5f - 0.5f * Math.cos((2.0 * Math.PI * p2).toDouble()).toFloat()
+
+            var v = read(dA, mask) * gA + read(dB, mask) * gB
+
+            if (rg > 0f) {
+                rp += ringInc
+                if (rp > 6.2831855f) rp -= 6.2831855f
+                val m = Math.sin(rp.toDouble()).toFloat()
+                v = v * (1f - rg) + v * m * rg
+            }
+            if (dr > 0f) {
+                val k = 1f + dr * 14f
+                v = Math.tanh((v * k).toDouble()).toFloat() * (1f / (1f + dr * 2.2f))
+            }
+
+            var o = v * 1.2f
+            if (o > 1f) o = 1f else if (o < -1f) o = -1f
+            outp[i] = (o * 32767f).toInt().toShort()
+        }
+        ph = phase
+        ringPh = rp
+    }
+
+    private fun read(d: Float, mask: Int): Float {
+        var p = w - 1 - d
+        if (p < 0f) p += NBUF
+        val i0 = p.toInt()
+        val i1 = (i0 + 1) and mask
+        val f = p - i0
+        val a = buf[i0 and mask]
+        val b = buf[i1]
+        return a + (b - a) * f
+    }
+}
+<<<END>>>
+<<<FILE:app/src/main/java/com/renesito/voice/FloatingService.kt>>>
+package com.renesito.voice
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
+
+class FloatingService : Service() {
+
+    data class Preset(
+        val id: String, val name: String,
+        val pitch: Float, val drive: Float, val ring: Float, val ringHz: Float,
+        val color: Int
+    )
+
+    private val presets = listOf(
+        Preset("normal",   "Normal",   0f,   0f,    0f,   60f, 0xFF3A3F4B.toInt()),
+        Preset("ardilla",  "Ardilla",  8f,   0.12f, 0f,   60f, 0xFFE04B6B.toInt()),
+        Preset("raton",    "Ratón",    12f,  0.08f, 0f,   60f, 0xFFD9569C.toInt()),
+        Preset("demonio",  "Demonio", -8f,   0.75f, 0.18f,33f, 0xFF8B2A2A.toInt()),
+        Preset("monstruo", "Monstruo",-12f,  0.9f,  0f,   60f, 0xFF5E2D7A.toInt()),
+        Preset("robot",    "Robot",    0f,   0.3f,  0.8f, 55f, 0xFF2F5BD8.toInt()),
+        Preset("alien",    "Alien",    6f,   0.25f, 0.9f, 130f,0xFF3FA9D8.toInt()),
+        Preset("gigante",  "Gigante", -5f,   0.4f,  0f,   60f, 0xFF7A5230.toInt()),
+        Preset("fantasma", "Fantasma",-3f,   0.2f,  0.5f, 24f, 0xFF3C7F6A.toInt()),
+        Preset("radio",    "Radio",    0f,   0.55f, 0f,   60f, 0xFF4A4A55.toInt())
+    )
+
+    private val layoutPos = mapOf(
+        "normal" to intArrayOf(165, 26),
+        "ardilla" to intArrayOf(78, 92),
+        "raton" to intArrayOf(252, 92),
+        "demonio" to intArrayOf(46, 160),
+        "monstruo" to intArrayOf(284, 160),
+        "robot" to intArrayOf(78, 228),
+        "alien" to intArrayOf(252, 228),
+        "gigante" to intArrayOf(165, 286),
+        "fantasma" to intArrayOf(118, 186),
+        "radio" to intArrayOf(212, 186)
+    )
+
+    private lateinit var wm: WindowManager
+    private lateinit var root: FrameLayout
+    private lateinit var params: WindowManager.LayoutParams
+    private val bubbles = HashMap<String, TextView>()
+    private val handler = Handler(Looper.getMainLooper())
+    private var engine: VoiceEngine? = null
+    private var levelFill: View? = null
+    private var levelWrap: View? = null
+    private var on = true
+    private var dragX = 0f
+    private var dragY = 0f
+
+    override fun onBind(i: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startForegroundCompat()
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        build()
+
+        val e = VoiceEngine()
+        e.levelListener = { v -> handler.post { setLevel(v) } }
+        e.configure(8f, 0.12f, 0f, 60f)
+        e.start()
+        engine = e
+    }
+
+    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+        if (i?.action == "stop") { stopSelf(); return START_NOT_STICKY }
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        engine?.stop()
+        engine = null
+        try { if (this::root.isInitialized) wm.removeView(root) } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    private fun startForegroundCompat() {
+        val ch = "renesito_voice"
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(
+            NotificationChannel(ch, "Renesito Voice", NotificationManager.IMPORTANCE_LOW)
+        )
+        val stop = PendingIntent.getService(
+            this, 0,
+            Intent(this, FloatingService::class.java).setAction("stop"),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        val n: Notification = Notification.Builder(this, ch)
+            .setSmallIcon(R.drawable.ic_launcher)
+            .setContentTitle("Renesito Voice activo")
+            .setContentText("Burbujas de voz listas")
+            .addAction(Notification.Action.Builder(null, "Detener", stop).build())
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(1, n)
+        }
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun build() {
+        root = FrameLayout(this)
+
+        for (p in presets) {
+            val pos = layoutPos[p.id] ?: continue
+            val size = dp(58)
+            val tv = TextView(this).apply {
+                text = p.name
+                textSize = 10.5f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                background = oval(p.color, false)
+                setOnClickListener { select(p) }
+            }
+            val lp = FrameLayout.LayoutParams(size, size).apply {
+                leftMargin = dp(pos[0]) - size / 2
+                topMargin = dp(pos[1]) - size / 2
+            }
+            root.addView(tv, lp)
+            bubbles[p.id] = tv
+        }
+
+        val center = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(6), dp(10), dp(7))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(0xE614161D.toInt())
+                setStroke(dp(1), 0xFF2E3242.toInt())
+            }
+            setOnClickListener { toggle() }
+        }
+        val name = TextView(this).apply {
+            text = "renesito lindo"
+            textSize = 9.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFB9C0D4.toInt())
+        }
+        val wrap = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(2).toFloat()
+                setColor(0xFF23252F.toInt())
+            }
+        }
+        val fill = View(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(2).toFloat()
+                setColor(0xFF3DDC84.toInt())
+            }
+        }
+        wrap.addView(fill, FrameLayout.LayoutParams(0, dp(3)))
+        val wrapLp = LinearLayout.LayoutParams(dp(64), dp(3)).apply { topMargin = dp(4) }
+        center.addView(name)
+        center.addView(wrap, wrapLp)
+        root.addView(center, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            leftMargin = dp(165) - dp(52)
+            topMargin = dp(160) - dp(20)
+        })
+        levelWrap = wrap
+        levelFill = fill
+
+        val handle = TextView(this).apply {
+            text = "⠿"
+            textSize = 13f
+            setTextColor(0xFF6F768C.toInt())
+            gravity = Gravity.CENTER
+        }
+        root.addView(handle, FrameLayout.LayoutParams(dp(40), dp(22)).apply {
+            leftMargin = dp(165) - dp(20)
+            topMargin = dp(304)
+        })
+        handle.setOnTouchListener { _, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragX = ev.rawX - params.x
+                    dragY = ev.rawY - params.y
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = (ev.rawX - dragX).toInt()
+                    params.y = (ev.rawY - dragY).toInt()
+                    wm.updateViewLayout(root, params)
+                    true
+                }
+                else -> true
+            }
+        }
+
+        val close = TextView(this).apply {
+            text = "×"
+            textSize = 15f
+            setTextColor(0xFF9AA0B4.toInt())
+            gravity = Gravity.CENTER
+            setOnClickListener { stopSelf() }
+        }
+        root.addView(close, FrameLayout.LayoutParams(dp(26), dp(26)).apply {
+            leftMargin = dp(165) + dp(96)
+            topMargin = dp(6)
+        })
+
+        params = WindowManager.LayoutParams(
+            dp(330), dp(330),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = dp(16)
+            y = dp(360)
+        }
+        wm.addView(root, params)
+
+        select(presets[1])
+    }
+
+    private fun oval(color: Int, selected: Boolean) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+        setStroke(dp(if (selected) 3 else 1), if (selected) Color.WHITE else 0x40FFFFFF)
+    }
+
+    private fun select(p: Preset) {
+        engine?.configure(p.pitch, p.drive, p.ring, p.ringHz)
+        for ((id, v) in bubbles) {
+            v.background = oval(presets.first { it.id == id }.color, id == p.id)
+        }
+        if (!on) toggle()
+    }
+
+    private fun toggle() {
+        on = !on
+        if (on) engine?.start() else engine?.stop()
+        root.alpha = if (on) 1f else 0.55f
+        setLevel(0f)
+    }
+
+    private fun setLevel(v: Float) {
+        if (!on) {
+            levelFill?.layoutParams?.let { it.width = 0; levelFill?.requestLayout() }
+            return
+        }
+        val w = levelWrap?.width ?: return
+        val px = (v * 6f * w).toInt().coerceIn(0, w)
+        levelFill?.layoutParams?.let {
+            it.width = px
+            levelFill?.requestLayout()
+        }
+    }
+}
+<<<END>>>
+<<<FILE:app/src/main/java/com/renesito/voice/MainActivity.kt>>>
+package com.renesito.voice
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+
+class MainActivity : Activity() {
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    override fun onCreate(s: Bundle?) {
+        super.onCreate(s)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(24), dp(90), dp(24), dp(24))
+            setBackgroundColor(0xFF0E0F14.toInt())
+        }
+
+        val title = TextView(this).apply {
+            text = "Renesito Voice"
+            textSize = 26f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+        }
+        val sub = TextView(this).apply {
+            text = "Burbujas de voz para Discord.\n\nUsa el ALTAVOZ del móvil, sin auriculares,\npara que Discord reciba el efecto.\n\nBaja la supresión de ruido de Discord."
+            textSize = 13f
+            setTextColor(0xFF9AA0B4.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, dp(26))
+        }
+
+     
